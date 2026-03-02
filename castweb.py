@@ -64,6 +64,9 @@ state = {
     "tmp_file": None,
 }
 
+dsp_lock = threading.Lock()
+dsp_settings = {"bass": 0, "mid": 0, "treble": 0, "loudnorm": False}
+
 # Set by main() at startup
 BROWSE_ROOT = ""
 LOCAL_IP = ""
@@ -89,7 +92,41 @@ def get_audio_codec(file_path):
     return None
 
 
-def transcode_audio(input_path):
+def build_audio_filters(dsp):
+    """Build ffmpeg -af filter chain string from DSP settings. Returns None if flat."""
+    filters = []
+    bass, mid, treble = dsp["bass"], dsp["mid"], dsp["treble"]
+    max_gain = max(bass, mid, treble, 0)
+
+    # Headroom to prevent clipping when boosting
+    if max_gain > 0:
+        filters.append(f"volume=-{max_gain}dB")
+
+    if bass != 0:
+        filters.append(f"bass=g={bass}:f=100")
+    if mid != 0:
+        filters.append(f"equalizer=f=1000:t=o:w=1.0:g={mid}")
+    if treble != 0:
+        filters.append(f"treble=g={treble}:f=3000")
+
+    if dsp["loudnorm"]:
+        filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+
+    return ",".join(filters) if filters else None
+
+
+def needs_transcode(audio_codec, dsp):
+    """Return True if codec is BT-incompatible OR any DSP setting is non-flat."""
+    if audio_codec and audio_codec in BT_INCOMPATIBLE_CODECS:
+        return True
+    if dsp["bass"] != 0 or dsp["mid"] != 0 or dsp["treble"] != 0:
+        return True
+    if dsp["loudnorm"]:
+        return True
+    return False
+
+
+def transcode_audio(input_path, audio_filters=None):
     """Transcode audio to AAC stereo, copy video. Updates state with progress."""
     base = os.path.splitext(os.path.basename(input_path))[0]
     out_fd, out_path = tempfile.mkstemp(suffix=".mp4", prefix=f"{base}.")
@@ -99,10 +136,13 @@ def transcode_audio(input_path):
         state["transcoding"] = True
         state["transcode_progress"] = "starting..."
 
+    cmd = ["ffmpeg", "-y", "-i", input_path]
+    if audio_filters:
+        cmd += ["-af", audio_filters]
+    cmd += ["-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "192k", out_path]
+
     proc = subprocess.Popen(
-        ["ffmpeg", "-y", "-i", input_path,
-         "-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "192k",
-         out_path],
+        cmd,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
 
@@ -198,9 +238,14 @@ def do_cast(file_path):
     serve_path = file_path
     tmp = None
 
+    with dsp_lock:
+        dsp = dict(dsp_settings)
+
     acodec = get_audio_codec(file_path)
-    if acodec and acodec in BT_INCOMPATIBLE_CODECS:
-        tmp = transcode_audio(file_path)
+    af = build_audio_filters(dsp)
+
+    if needs_transcode(acodec, dsp):
+        tmp = transcode_audio(file_path, audio_filters=af)
         if tmp is None:
             with state_lock:
                 state["casting"] = False
@@ -287,6 +332,8 @@ class WebHandler(BaseHTTPRequestHandler):
             self.handle_stop()
         elif path == "/api/control":
             self.handle_control()
+        elif path == "/api/dsp":
+            self.handle_dsp()
         else:
             self.send_error(404)
 
@@ -332,12 +379,15 @@ class WebHandler(BaseHTTPRequestHandler):
 
     def handle_status(self):
         with state_lock:
-            self.send_json({
+            s = {
                 "casting": state["casting"],
                 "file": os.path.basename(state["file"]) if state["file"] else None,
                 "transcoding": state["transcoding"],
                 "transcode_progress": state["transcode_progress"],
-            })
+            }
+        with dsp_lock:
+            s["dsp"] = dict(dsp_settings)
+        self.send_json(s)
 
     def handle_cast(self):
         body = json.loads(self.read_body())
@@ -384,6 +434,29 @@ class WebHandler(BaseHTTPRequestHandler):
             return
         threading.Thread(target=adb_key, args=(keycode,), daemon=True).start()
         self.send_json({"ok": True})
+
+    def handle_dsp(self):
+        body = json.loads(self.read_body())
+        errors = []
+        for key in ("bass", "mid", "treble"):
+            if key in body:
+                val = body[key]
+                if not isinstance(val, (int, float)) or val < -12 or val > 12:
+                    errors.append(f"{key} must be a number between -12 and 12")
+        if "loudnorm" in body and not isinstance(body["loudnorm"], bool):
+            errors.append("loudnorm must be a boolean")
+        if errors:
+            self.send_json({"error": "; ".join(errors)}, 400)
+            return
+
+        with dsp_lock:
+            for key in ("bass", "mid", "treble"):
+                if key in body:
+                    dsp_settings[key] = int(body[key])
+            if "loudnorm" in body:
+                dsp_settings["loudnorm"] = body["loudnorm"]
+            result = dict(dsp_settings)
+        self.send_json({"ok": True, "dsp": result})
 
     def handle_media(self, path, send_body):
         """Serve the currently-casting media file with Range support."""
@@ -528,16 +601,90 @@ header h1 { font-size: 1.2rem; color: #e94560; }
 .controls button:active { background: #e94560; }
 .controls button.stop-btn { background: #7a1a1a; border-color: #a33; }
 .controls button.stop-btn:hover { background: #a33; }
+.eq-toggle {
+  margin-left: auto; background: #0f3460; color: #e0e0e0; border: 1px solid #1a3a6e;
+  border-radius: 6px; padding: 6px 12px; font-size: 0.85rem; cursor: pointer;
+  transition: background 0.15s;
+}
+.eq-toggle:hover { background: #1a4a80; }
+.eq-toggle.active { background: #e94560; border-color: #e94560; }
+.dsp-panel {
+  display: none; background: #16213e; border-top: 1px solid #0f3460;
+  border-bottom: 1px solid #0f3460; padding: 12px 16px;
+}
+.dsp-panel.open { display: block; }
+.dsp-presets {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
+}
+.dsp-presets button {
+  background: #0f3460; color: #e0e0e0; border: 1px solid #1a3a6e;
+  border-radius: 6px; padding: 5px 10px; font-size: 0.8rem; cursor: pointer;
+  transition: background 0.15s;
+}
+.dsp-presets button:hover { background: #1a4a80; }
+.dsp-presets button.active { background: #53a8b6; border-color: #53a8b6; color: #111; }
+.dsp-slider-row {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 6px;
+}
+.dsp-slider-row label {
+  width: 50px; font-size: 0.85rem; color: #aaa; text-align: right;
+}
+.dsp-slider-row input[type="range"] {
+  flex: 1; accent-color: #e94560; cursor: pointer;
+}
+.dsp-slider-row .dsp-val {
+  width: 40px; font-size: 0.8rem; color: #e94560; text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.dsp-options {
+  display: flex; align-items: center; gap: 12px; margin-top: 8px;
+}
+.dsp-options label {
+  font-size: 0.85rem; color: #aaa; display: flex; align-items: center; gap: 6px;
+  cursor: pointer;
+}
+.dsp-options input[type="checkbox"] { accent-color: #e94560; cursor: pointer; }
+.dsp-note {
+  font-size: 0.75rem; color: #666; margin-top: 8px;
+}
 </style>
 </head>
 <body>
 
 <header>
   <h1>castweb</h1>
+  <button class="eq-toggle" id="eq-toggle" onclick="toggleDSP()" title="Audio EQ (e)">EQ</button>
 </header>
 
 <div class="breadcrumb" id="breadcrumb"></div>
 <div class="file-list" id="file-list"></div>
+<div class="dsp-panel" id="dsp-panel">
+  <div class="dsp-presets">
+    <button onclick="dspPreset('flat')">Flat</button>
+    <button onclick="dspPreset('warm')">Warm</button>
+    <button onclick="dspPreset('bass_boost')">Bass Boost</button>
+    <button onclick="dspPreset('vocal')">Vocal Clarity</button>
+  </div>
+  <div class="dsp-slider-row">
+    <label>Bass</label>
+    <input type="range" id="dsp-bass" min="-12" max="12" value="0" oninput="dspChanged()">
+    <span class="dsp-val" id="dsp-bass-val">0 dB</span>
+  </div>
+  <div class="dsp-slider-row">
+    <label>Mid</label>
+    <input type="range" id="dsp-mid" min="-12" max="12" value="0" oninput="dspChanged()">
+    <span class="dsp-val" id="dsp-mid-val">0 dB</span>
+  </div>
+  <div class="dsp-slider-row">
+    <label>Treble</label>
+    <input type="range" id="dsp-treble" min="-12" max="12" value="0" oninput="dspChanged()">
+    <span class="dsp-val" id="dsp-treble-val">0 dB</span>
+  </div>
+  <div class="dsp-options">
+    <label><input type="checkbox" id="dsp-loudnorm" onchange="dspChanged()"> Loudness normalization</label>
+  </div>
+  <div class="dsp-note">EQ changes apply on the next cast.</div>
+</div>
 <div class="status-bar" id="status-bar">
   <span class="label">Ready</span>
 </div>
@@ -665,6 +812,8 @@ async function pollStatus() {
     const s = await resp.json();
     const bar = document.getElementById("status-bar");
 
+    if (s.dsp) syncDSPFromStatus(s.dsp);
+
     if (s.transcoding) {
       bar.innerHTML = `<span class="label">Transcoding</span><span class="info">${escHtml(s.file || "")} &mdash; ${escHtml(s.transcode_progress)}</span>`;
     } else if (s.casting) {
@@ -683,6 +832,70 @@ function stopPolling() {
   if (polling) { clearInterval(polling); polling = null; }
 }
 
+// --- DSP / EQ ---
+let dspInited = false;
+
+function toggleDSP() {
+  const panel = document.getElementById("dsp-panel");
+  const btn = document.getElementById("eq-toggle");
+  panel.classList.toggle("open");
+  btn.classList.toggle("active", panel.classList.contains("open"));
+}
+
+const DSP_PRESETS = {
+  flat:       {bass: 0,  mid: 0,  treble: 0},
+  warm:       {bass: 6,  mid: 2,  treble: -2},
+  bass_boost: {bass: 9,  mid: 0,  treble: 0},
+  vocal:      {bass: -2, mid: 4,  treble: 2},
+};
+
+function dspPreset(name) {
+  const p = DSP_PRESETS[name];
+  if (!p) return;
+  document.getElementById("dsp-bass").value = p.bass;
+  document.getElementById("dsp-mid").value = p.mid;
+  document.getElementById("dsp-treble").value = p.treble;
+  dspChanged();
+}
+
+function dspChanged() {
+  const bass = parseInt(document.getElementById("dsp-bass").value);
+  const mid = parseInt(document.getElementById("dsp-mid").value);
+  const treble = parseInt(document.getElementById("dsp-treble").value);
+  const loudnorm = document.getElementById("dsp-loudnorm").checked;
+
+  document.getElementById("dsp-bass-val").textContent = (bass > 0 ? "+" : "") + bass + " dB";
+  document.getElementById("dsp-mid-val").textContent = (mid > 0 ? "+" : "") + mid + " dB";
+  document.getElementById("dsp-treble-val").textContent = (treble > 0 ? "+" : "") + treble + " dB";
+
+  // Highlight matching preset button
+  const presetBtns = document.querySelectorAll(".dsp-presets button");
+  presetBtns.forEach(btn => btn.classList.remove("active"));
+  for (const [name, p] of Object.entries(DSP_PRESETS)) {
+    if (p.bass === bass && p.mid === mid && p.treble === treble) {
+      const idx = Object.keys(DSP_PRESETS).indexOf(name);
+      presetBtns[idx].classList.add("active");
+    }
+  }
+
+  fetch("/api/dsp", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({bass, mid, treble, loudnorm}),
+  });
+}
+
+function syncDSPFromStatus(dsp) {
+  if (!dsp || dspInited) return;
+  dspInited = true;
+  document.getElementById("dsp-bass").value = dsp.bass;
+  document.getElementById("dsp-mid").value = dsp.mid;
+  document.getElementById("dsp-treble").value = dsp.treble;
+  document.getElementById("dsp-loudnorm").checked = dsp.loudnorm;
+  // Update display labels and preset highlight
+  dspChanged();
+}
+
 // Keyboard shortcuts
 document.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT") return;
@@ -694,6 +907,7 @@ document.addEventListener("keydown", (e) => {
     case "ArrowDown": e.preventDefault(); ctrl("vol_down"); break;
     case "m": ctrl("mute"); break;
     case "s": doStop(); break;
+    case "e": toggleDSP(); break;
   }
 });
 
@@ -736,14 +950,14 @@ def main():
     print("connected.")
 
     server = ThreadingHTTPServer(("0.0.0.0", PORT), WebHandler)
+    server.daemon_threads = True
     print(f"serving on http://{LOCAL_IP}:{PORT}/")
     print(f"browse root: {BROWSE_ROOT}")
 
     def shutdown_handler(sig, frame):
         print("\nshutting down...")
         cleanup_cast()
-        server.shutdown()
-        sys.exit(0)
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
