@@ -1,4 +1,4 @@
-# Mediacast — Custom Firmware for Budget Android Projectors
+# Mediacast — Custom Streaming & Control Apps for Budget Android Projectors
 
 Turn a cheap Android projector into a proper media center with real-time EQ, a clean home screen, and no vendor bloat. Designed for the FUDONI GC888 (Siviton/MediaTek MT5862, Android 9), but should work on similar budget projectors.
 
