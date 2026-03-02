@@ -1,0 +1,4 @@
+__pycache__/
+android/build/
+android/launcher/build/
+android/debug.jks
