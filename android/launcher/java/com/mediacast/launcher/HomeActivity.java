@@ -20,7 +20,7 @@ import android.view.WindowManager;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
-import java.net.Socket;
+import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
@@ -171,16 +171,8 @@ public class HomeActivity extends Activity {
         } catch (Exception e) {}
     }
 
-    private boolean isPlayerRunning() {
-        // EQ Player runs an HTTP server on port 8081 — if we can connect, it's alive
-        try {
-            Socket sock = new Socket();
-            sock.connect(new java.net.InetSocketAddress("127.0.0.1", 8081), 200);
-            sock.close();
-            return true;
-        } catch (Exception e) {
-            return false;
-        }
+    private boolean hasResumeState() {
+        return new File("/data/local/tmp/eqplayer_resume").exists();
     }
 
     private void updateResumeButton() {
@@ -188,7 +180,7 @@ public class HomeActivity extends Activity {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final boolean active = isPlayerRunning();
+                final boolean active = hasResumeState();
                 handler.post(new Runnable() {
                     @Override
                     public void run() {

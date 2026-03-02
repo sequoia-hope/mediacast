@@ -14,9 +14,11 @@ import java.net.Socket;
 /**
  * Minimal HTTP server for receiving EQ commands from castweb.
  *
- * POST /eq       — body: {"bands": [300, 0, -200, 0, 200]} (millibels per band)
- * POST /loudnorm — body: {"enabled": true, "gain": 600}
- * GET  /info     — return band count, frequency ranges, current levels, player status
+ * POST /eq           — body: {"bands": [300, 0, -200, 0, 200]} (millibels per band)
+ * POST /loudnorm     — body: {"enabled": true, "gain": 600}
+ * POST /select_track — body: {"type": "audio"|"subtitle", "index": N}
+ * GET  /info         — return band count, frequency ranges, current levels, player status
+ * GET  /tracks       — alias for /info (includes track info)
  */
 public class EqServer {
 
@@ -103,10 +105,14 @@ public class EqServer {
             String response;
             if ("GET".equals(method) && "/info".equals(path)) {
                 response = handleInfo();
+            } else if ("GET".equals(method) && "/tracks".equals(path)) {
+                response = handleInfo();
             } else if ("POST".equals(method) && "/eq".equals(path)) {
                 response = handleEq(body);
             } else if ("POST".equals(method) && "/loudnorm".equals(path)) {
                 response = handleLoudnorm(body);
+            } else if ("POST".equals(method) && "/select_track".equals(path)) {
+                response = handleSelectTrack(body);
             } else {
                 sendResponse(os, 404, "{\"error\":\"not found\"}");
                 client.close();
@@ -190,6 +196,48 @@ public class EqServer {
                 @Override
                 public void run() {
                     activity.setLoudnessEnhancerEnabled(enabled, finalGain);
+                }
+            });
+
+            return "{\"ok\":true}";
+        } catch (Exception e) {
+            return "{\"error\":\"" + e.getMessage() + "\"}";
+        }
+    }
+
+    private String handleSelectTrack(String body) {
+        // Parse {"type": "audio"|"subtitle", "index": N}
+        try {
+            String type = null;
+            int tIdx = body.indexOf("\"type\"");
+            if (tIdx >= 0) {
+                int q1 = body.indexOf('"', body.indexOf(':', tIdx) + 1);
+                int q2 = body.indexOf('"', q1 + 1);
+                if (q1 >= 0 && q2 > q1) {
+                    type = body.substring(q1 + 1, q2);
+                }
+            }
+            int index = -1;
+            int iIdx = body.indexOf("\"index\"");
+            if (iIdx >= 0) {
+                String sub = body.substring(body.indexOf(':', iIdx) + 1);
+                String numPart = sub.replaceAll("[^0-9\\-]", " ").trim().split("\\s+")[0];
+                index = Integer.parseInt(numPart);
+            }
+
+            if (type == null) return "{\"error\":\"missing type\"}";
+
+            final String finalType = type;
+            final int finalIndex = index;
+
+            activity.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    if ("audio".equals(finalType)) {
+                        activity.selectAudioTrack(finalIndex);
+                    } else if ("subtitle".equals(finalType)) {
+                        activity.selectSubtitleTrack(finalIndex);
+                    }
                 }
             });
 

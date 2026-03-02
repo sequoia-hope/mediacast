@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
@@ -64,6 +65,11 @@ state = {
     "transcode_progress": "",
     "tmp_file": None,
     "_serve_path": None,
+    "track_info": None,
+    "subtitle_files": [],
+    "_subtitle_tmp_files": [],
+    "_transcode_proc": None,
+    "_input_size": 0,
 }
 
 dsp_lock = threading.Lock()
@@ -94,6 +100,105 @@ def get_audio_codec(file_path):
     return None
 
 
+TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
+
+
+def probe_tracks(file_path):
+    """Probe all audio and subtitle streams + duration via ffprobe."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries",
+             "stream=index,codec_name,codec_type:stream_tags=language,title"
+             ":format=duration",
+             "-of", "json", file_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        info = json.loads(r.stdout)
+    except Exception:
+        return {"audio_tracks": [], "subtitle_tracks": [], "duration_ms": 0}
+
+    audio_tracks = []
+    subtitle_tracks = []
+    audio_idx = 0
+    sub_idx = 0
+    for s in info.get("streams", []):
+        tags = s.get("tags", {})
+        lang = tags.get("language", "")
+        title = tags.get("title", "")
+        codec = s.get("codec_name", "")
+        if s.get("codec_type") == "audio":
+            audio_tracks.append({
+                "index": s["index"], "stream_index": audio_idx,
+                "codec": codec, "language": lang, "title": title,
+            })
+            audio_idx += 1
+        elif s.get("codec_type") == "subtitle":
+            subtitle_tracks.append({
+                "index": s["index"], "stream_index": sub_idx,
+                "codec": codec, "language": lang, "title": title,
+            })
+            sub_idx += 1
+
+    duration_s = float(info.get("format", {}).get("duration", 0))
+    duration_ms = int(duration_s * 1000)
+
+    return {"audio_tracks": audio_tracks, "subtitle_tracks": subtitle_tracks,
+            "duration_ms": duration_ms}
+
+
+def extract_subtitles(file_path, subtitle_tracks):
+    """Extract text-based subtitle tracks to temp .srt files. Returns list of dicts."""
+    results = []
+    for st in subtitle_tracks:
+        codec = st["codec"].lower()
+        if codec not in TEXT_SUB_CODECS:
+            continue  # Skip bitmap formats (pgs, dvd_subtitle, etc.)
+        lang = st["language"] or f"track{st['stream_index']}"
+        label = st["title"] or lang
+        fd, tmp_path = tempfile.mkstemp(suffix=".srt", prefix=f"sub_{lang}_")
+        os.close(fd)
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-i", file_path,
+                 "-map", f"0:{st['index']}", "-c:s", "srt", tmp_path],
+                capture_output=True, text=True, timeout=120,
+            )
+            if r.returncode == 0 and os.path.getsize(tmp_path) > 0:
+                results.append({
+                    "path": tmp_path, "language": lang, "label": label,
+                    "source": "embedded", "stream_index": st["stream_index"],
+                })
+            else:
+                os.unlink(tmp_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+    return results
+
+
+def find_companion_srt(file_path):
+    """Find .srt files alongside the media file (e.g., movie.srt, movie.en.srt)."""
+    directory = os.path.dirname(file_path)
+    base = os.path.splitext(os.path.basename(file_path))[0]
+    results = []
+    try:
+        for name in os.listdir(directory):
+            if not name.lower().endswith(".srt"):
+                continue
+            srt_base = os.path.splitext(name)[0]
+            if srt_base == base or srt_base.startswith(base + "."):
+                suffix = srt_base[len(base):].lstrip(".")
+                label = suffix if suffix else "external"
+                full = os.path.join(directory, name)
+                results.append({
+                    "path": full, "language": suffix or "und",
+                    "label": label, "source": "companion",
+                })
+    except OSError:
+        pass
+    return results
+
+
 EQ_PLAYER_URL = f"http://{PROJECTOR_IP}:8081"
 
 
@@ -122,46 +227,79 @@ def send_eq_to_player(dsp):
         print(f"Loudnorm send failed: {e}")
 
 
-def transcode_audio(input_path):
-    """Transcode audio to AAC stereo (flat, no EQ filters), copy video."""
+def transcode_audio(input_path, seek_seconds=0):
+    """Start streaming transcode: AAC stereo, MPEG-TS for instant playback.
+
+    Returns (out_path, proc) immediately after the first data is written,
+    or (None, None) if ffmpeg fails to start.
+    """
     base = os.path.splitext(os.path.basename(input_path))[0]
-    out_fd, out_path = tempfile.mkstemp(suffix=".mp4", prefix=f"{base}.")
+    out_fd, out_path = tempfile.mkstemp(suffix=".ts", prefix=f"{base}.")
     os.close(out_fd)
 
     with state_lock:
         state["transcoding"] = True
         state["transcode_progress"] = "starting..."
 
-    cmd = ["ffmpeg", "-y", "-fflags", "+genpts",
-           "-i", input_path,
-           "-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "192k", out_path]
+    cmd = ["ffmpeg", "-y", "-fflags", "+genpts"]
+    if seek_seconds > 0:
+        cmd += ["-ss", str(seek_seconds)]
+    cmd += ["-i", input_path,
+            "-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "192k",
+            "-f", "mpegts", out_path]
 
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
 
-    while proc.poll() is None:
-        line = proc.stderr.readline()
-        if not line:
+    # Monitor progress in background thread
+    def monitor():
+        while proc.poll() is None:
+            line = proc.stderr.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace")
+            if "time=" in text:
+                for part in text.split():
+                    if part.startswith("time="):
+                        with state_lock:
+                            # Only update if we're still the active transcode
+                            if state.get("_transcode_proc") is proc:
+                                state["transcode_progress"] = part
+        proc.wait()
+        with state_lock:
+            # Only clear state if we're still the active transcode —
+            # a seek may have replaced us with a new proc
+            if state.get("_transcode_proc") is proc:
+                state["transcoding"] = False
+                state["transcode_progress"] = ""
+                state["_transcode_proc"] = None
+
+    threading.Thread(target=monitor, daemon=True).start()
+
+    # Wait for the first TS packets to be written
+    for _ in range(300):  # up to 30s
+        if proc.poll() is not None:
             break
-        text = line.decode("utf-8", errors="replace")
-        if "time=" in text:
-            for part in text.split():
-                if part.startswith("time="):
-                    with state_lock:
-                        state["transcode_progress"] = part
+        try:
+            if os.path.getsize(out_path) > 256 * 1024:
+                break
+        except OSError:
+            pass
+        time.sleep(0.1)
 
-    proc.wait()
+    if proc.poll() is not None and proc.returncode != 0:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+        with state_lock:
+            state["transcoding"] = False
+            state["_transcode_proc"] = None
+        return None, None
 
-    with state_lock:
-        state["transcoding"] = False
-
-    if proc.returncode != 0:
-        os.unlink(out_path)
-        return None
-
-    return out_path
+    return out_path, proc
 
 
 # ---------------------------------------------------------------------------
@@ -187,16 +325,25 @@ def adb_connect():
         sys.exit(f"adb connect failed: {out}")
 
 
-def adb_open_url(url, mime):
+def adb_open_url(url, mime, subtitle_list=None, audio_count=0,
+                 duration_ms=0, seek_offset_ms=0):
     adb("shell", "input", "keyevent", "KEYCODE_WAKEUP")
     adb("shell", "settings", "put", "secure", "screensaver_enabled", "0")
-    adb(
-        "shell", "am", "start",
-        "-a", "android.intent.action.VIEW",
-        "-d", url,
-        "-t", mime,
-        "-n", "com.mediacast.eqplayer/.MainActivity",
-    )
+    # Build am start as a single shell command string to control quoting
+    am_cmd = (f"am start -a android.intent.action.VIEW"
+              f" -d '{url}' -t '{mime}'"
+              f" -n com.mediacast.eqplayer/.MainActivity")
+    if subtitle_list:
+        subs_json = json.dumps(subtitle_list, separators=(",", ":"))
+        # Single-quote for the remote shell; JSON never contains single quotes
+        am_cmd += f" --es subtitles '{subs_json}'"
+    if audio_count > 0:
+        am_cmd += f" --ei audio_count {audio_count}"
+    if duration_ms > 0:
+        am_cmd += f" --el duration {duration_ms}"
+    if seek_offset_ms > 0:
+        am_cmd += f" --el seek_offset {seek_offset_ms}"
+    adb("shell", am_cmd)
 
 
 def adb_stop():
@@ -234,11 +381,14 @@ def do_cast(file_path):
     serve_path = file_path
     tmp = None
 
+    # Probe tracks
+    tracks = probe_tracks(file_path)
+
     acodec = get_audio_codec(file_path)
 
     # Only transcode for BT-incompatible codecs (flat audio, no EQ filters)
     if acodec and acodec in BT_INCOMPATIBLE_CODECS:
-        tmp = transcode_audio(file_path)
+        tmp, proc = transcode_audio(file_path)
         if tmp is None:
             with state_lock:
                 state["casting"] = False
@@ -246,24 +396,138 @@ def do_cast(file_path):
                 state["transcode_progress"] = "transcode failed"
             return
         serve_path = tmp
+        with state_lock:
+            state["_transcode_proc"] = proc
+            state["_input_size"] = os.path.getsize(file_path)
+
+    # Extract embedded subtitles and find companion .srt files
+    extracted_subs = extract_subtitles(file_path, tracks["subtitle_tracks"])
+    companion_subs = find_companion_srt(file_path)
+    all_subs = extracted_subs + companion_subs
+
+    # Build subtitle URL list
+    subtitle_list = []
+    sub_tmp_files = []
+    for i, sub in enumerate(all_subs):
+        fname_sub = urllib.parse.quote(f"sub_{i}_{sub['language']}.srt")
+        sub_url = f"http://{LOCAL_IP}:{PORT}/subs/{i}/{fname_sub}"
+        subtitle_list.append({
+            "url": sub_url, "language": sub["language"],
+            "label": sub["label"], "source": sub["source"],
+        })
+        if sub["source"] == "embedded":
+            sub_tmp_files.append(sub["path"])
 
     with state_lock:
         state["tmp_file"] = tmp
+        state["transcoding"] = False
         state["transcode_progress"] = ""
+        state["track_info"] = tracks
+        state["subtitle_files"] = all_subs
+        state["_subtitle_tmp_files"] = sub_tmp_files
 
     ext = os.path.splitext(serve_path)[1].lower()
-    mime = mimetypes.guess_type(serve_path)[0] or MIME_FALLBACKS.get(ext, "video/mp4")
+    mime = MIME_FALLBACKS.get(ext) or mimetypes.guess_type(serve_path)[0] or "video/mp4"
 
     fname = urllib.parse.quote(os.path.basename(serve_path))
     url = f"http://{LOCAL_IP}:{PORT}/media/{fname}"
 
-    adb_open_url(url, mime)
+    audio_count = len(tracks["audio_tracks"])
+    duration_ms = tracks.get("duration_ms", 0)
+    adb_open_url(url, mime, subtitle_list, audio_count, duration_ms=duration_ms)
 
     with state_lock:
         state["casting"] = True
         state["_serve_path"] = serve_path
 
     # Apply current EQ settings to the player app
+    with dsp_lock:
+        dsp = dict(dsp_settings)
+    send_eq_to_player(dsp)
+
+
+_seek_lock = threading.Lock()
+
+def do_seek(position_ms):
+    """Kill current transcode, start new one at the given position, relaunch player."""
+    if not _seek_lock.acquire(blocking=False):
+        return  # Another seek already in progress
+    try:
+        _do_seek_inner(position_ms)
+    finally:
+        _seek_lock.release()
+
+def _do_seek_inner(position_ms):
+    with state_lock:
+        file_path = state.get("file")
+        track_info = state.get("track_info")
+        all_subs = list(state.get("subtitle_files", []))
+
+    if not file_path:
+        return
+
+    acodec = get_audio_codec(file_path)
+    if not (acodec and acodec in BT_INCOMPATIBLE_CODECS):
+        return  # Non-transcoded file — player handles seeks locally
+
+    seek_seconds = position_ms / 1000.0
+
+    # Kill old transcode first to free RAM (512MB device)
+    with state_lock:
+        old_proc = state.get("_transcode_proc")
+        old_tmp = state.get("tmp_file")
+        state["_transcode_proc"] = None  # Prevent old monitor from clobbering
+
+    if old_proc is not None:
+        try:
+            old_proc.kill()
+            old_proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    # Start new transcode at seek position
+    new_tmp, new_proc = transcode_audio(file_path, seek_seconds=seek_seconds)
+    if new_tmp is None:
+        with state_lock:
+            state["transcode_progress"] = "seek failed"
+        return
+
+    with state_lock:
+        state["tmp_file"] = new_tmp
+        state["_serve_path"] = new_tmp
+        state["_transcode_proc"] = new_proc
+        state["_input_size"] = os.path.getsize(file_path)
+
+    if old_tmp and old_tmp != new_tmp and os.path.exists(old_tmp):
+        try:
+            os.unlink(old_tmp)
+        except OSError:
+            pass
+
+    ext = os.path.splitext(new_tmp)[1].lower()
+    mime = MIME_FALLBACKS.get(ext) or mimetypes.guess_type(new_tmp)[0] or "video/mp4"
+    fname = urllib.parse.quote(os.path.basename(new_tmp))
+    url = f"http://{LOCAL_IP}:{PORT}/media/{fname}"
+
+    duration_ms = (track_info or {}).get("duration_ms", 0)
+
+    subtitle_list = []
+    for i, sub in enumerate(all_subs):
+        fname_sub = urllib.parse.quote(f"sub_{i}_{sub['language']}.srt")
+        sub_url = f"http://{LOCAL_IP}:{PORT}/subs/{i}/{fname_sub}"
+        subtitle_list.append({
+            "url": sub_url, "language": sub["language"],
+            "label": sub["label"], "source": sub["source"],
+        })
+
+    audio_count = len((track_info or {}).get("audio_tracks", []))
+
+    adb_open_url(url, mime, subtitle_list, audio_count,
+                 duration_ms=duration_ms, seek_offset_ms=position_ms)
+
+    with state_lock:
+        state["casting"] = True
+
     with dsp_lock:
         dsp = dict(dsp_settings)
     send_eq_to_player(dsp)
@@ -306,8 +570,12 @@ class WebHandler(BaseHTTPRequestHandler):
             self.handle_browse(parsed.query)
         elif path == "/api/status":
             self.handle_status()
+        elif path == "/api/tracks":
+            self.handle_get_tracks()
         elif path.startswith("/media/"):
             self.handle_media(path, send_body=True)
+        elif path.startswith("/subs/"):
+            self.handle_subs(path)
         else:
             self.send_error(404)
 
@@ -330,6 +598,10 @@ class WebHandler(BaseHTTPRequestHandler):
             self.handle_control()
         elif path == "/api/dsp":
             self.handle_dsp()
+        elif path == "/api/select_track":
+            self.handle_select_track()
+        elif path == "/api/seek":
+            self.handle_seek()
         else:
             self.send_error(404)
 
@@ -380,6 +652,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 "file": os.path.basename(state["file"]) if state["file"] else None,
                 "transcoding": state["transcoding"],
                 "transcode_progress": state["transcode_progress"],
+                "audio_count": len((state.get("track_info") or {}).get("audio_tracks", [])),
+                "subtitle_count": len(state.get("subtitle_files", [])),
             }
         with dsp_lock:
             s["dsp"] = dict(dsp_settings)
@@ -399,7 +673,7 @@ class WebHandler(BaseHTTPRequestHandler):
         with state_lock:
             state["casting"] = False
             state["file"] = resolved
-            state["transcoding"] = False
+            state["transcoding"] = True
             state["transcode_progress"] = "checking audio..."
 
         threading.Thread(target=do_cast, args=(resolved,), daemon=True).start()
@@ -459,17 +733,24 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_json({"ok": True, "dsp": result, "live_update": True})
 
     def handle_media(self, path, send_body):
-        """Serve the currently-casting media file with Range support."""
+        """Serve the currently-casting media file with Range support.
+
+        During streaming transcode, reports the input file size as
+        Content-Length (close estimate since video is copied) and blocks
+        on read when the player outruns ffmpeg.
+        """
         with state_lock:
             serve_path = state.get("_serve_path")
+            transcode_proc = state.get("_transcode_proc")
 
         if not serve_path or not os.path.isfile(serve_path):
             self.send_error(404)
             return
 
+        streaming = transcode_proc is not None and transcode_proc.poll() is None
         size = os.path.getsize(serve_path)
         ext = os.path.splitext(serve_path)[1].lower()
-        ctype = mimetypes.guess_type(serve_path)[0] or MIME_FALLBACKS.get(ext, "video/mp4")
+        ctype = MIME_FALLBACKS.get(ext) or mimetypes.guess_type(serve_path)[0] or "video/mp4"
 
         range_hdr = self.headers.get("Range")
         if range_hdr:
@@ -509,11 +790,100 @@ class WebHandler(BaseHTTPRequestHandler):
                 remaining = length
                 while remaining > 0:
                     chunk = f.read(min(remaining, 256 * 1024))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
+                    if chunk:
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                    else:
+                        # No data yet — if transcode is still running, wait
+                        with state_lock:
+                            proc = state.get("_transcode_proc")
+                            still_ours = state.get("_serve_path") == serve_path
+                        if still_ours and proc is not None and proc.poll() is None:
+                            time.sleep(0.2)
+                        else:
+                            break  # Transcode done, seek replaced us, or static file
         except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def handle_subs(self, path):
+        """Serve extracted/companion subtitle files: /subs/<index>/filename.srt"""
+        parts = path.split("/")  # ['', 'subs', '<index>', 'filename.srt']
+        if len(parts) < 4:
+            self.send_error(404)
+            return
+        try:
+            idx = int(parts[2])
+        except ValueError:
+            self.send_error(404)
+            return
+        with state_lock:
+            subs = list(state.get("subtitle_files", []))
+        if idx < 0 or idx >= len(subs):
+            self.send_error(404)
+            return
+        sub_path = subs[idx]["path"]
+        if not os.path.isfile(sub_path):
+            self.send_error(404)
+            return
+        try:
+            with open(sub_path, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-subrip")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception:
+            self.send_error(500)
+
+    def handle_get_tracks(self):
+        """Return track info for the current cast."""
+        with state_lock:
+            tracks = state.get("track_info")
+            subs = state.get("subtitle_files", [])
+        if tracks is None:
+            self.send_json({"audio_tracks": [], "subtitle_tracks": []})
+            return
+        sub_list = [{"language": s["language"], "label": s["label"],
+                     "source": s["source"]} for s in subs]
+        result = dict(tracks)
+        result["subtitle_files"] = sub_list
+        self.send_json(result)
+
+    def handle_select_track(self):
+        """Forward track selection to the player's HTTP server."""
+        body = json.loads(self.read_body())
+        track_type = body.get("type", "")
+        index = body.get("index", -1)
+        if track_type not in ("audio", "subtitle"):
+            self.send_json({"error": "type must be 'audio' or 'subtitle'"}, 400)
+            return
+        try:
+            data = json.dumps({"type": track_type, "index": index}).encode()
+            req = Request(f"{EQ_PLAYER_URL}/select_track", data=data,
+                          headers={"Content-Type": "application/json"})
+            resp = urlopen(req, timeout=5)
+            result = json.loads(resp.read().decode())
+            self.send_json(result)
+        except (URLError, OSError) as e:
+            self.send_json({"error": str(e)}, 502)
+
+    def handle_seek(self):
+        """Handle seek-ahead request from the player during streaming transcode."""
+        body = json.loads(self.read_body())
+        position_ms = body.get("position_ms", 0)
+        if position_ms < 0:
+            self.send_json({"error": "invalid position"}, 400)
+            return
+        threading.Thread(target=do_seek, args=(position_ms,), daemon=True).start()
+        self.send_json({"ok": True, "seeking_to": position_ms})
+
+    def handle(self):
+        """Suppress ConnectionResetError from player dropping keep-alive connections."""
+        try:
+            super().handle()
+        except ConnectionResetError:
             pass
 
     def log_message(self, fmt, *args):
@@ -532,8 +902,27 @@ def cleanup_cast():
         state["_serve_path"] = None
         tmp = state.get("tmp_file")
         state["tmp_file"] = None
+        state["track_info"] = None
+        state["subtitle_files"] = []
+        sub_tmps = state.get("_subtitle_tmp_files", [])
+        state["_subtitle_tmp_files"] = []
+        proc = state.get("_transcode_proc")
+        state["_transcode_proc"] = None
+        state["_input_size"] = 0
+    if proc is not None:
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
     if tmp and os.path.exists(tmp):
         os.unlink(tmp)
+    for f in sub_tmps:
+        try:
+            if os.path.exists(f):
+                os.unlink(f)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +1049,7 @@ header h1 { font-size: 1.2rem; color: #e94560; }
 <header>
   <h1>castweb</h1>
   <button class="eq-toggle" id="eq-toggle" onclick="toggleDSP()" title="Audio EQ (e)">EQ</button>
+  <button class="eq-toggle" id="tracks-toggle" onclick="toggleTracks()" title="Tracks (t)">Tracks</button>
 </header>
 
 <div class="breadcrumb" id="breadcrumb"></div>
@@ -691,6 +1081,13 @@ header h1 { font-size: 1.2rem; color: #e94560; }
   </div>
   <div class="dsp-status" id="dsp-status"></div>
   <div class="dsp-note">EQ applied in real-time on the projector.</div>
+</div>
+<div class="dsp-panel" id="tracks-panel">
+  <div style="font-size:0.85rem;color:#aaa;margin-bottom:8px;">Audio Tracks</div>
+  <div class="dsp-presets" id="audio-track-btns"></div>
+  <div style="font-size:0.85rem;color:#aaa;margin:10px 0 8px;">Subtitles</div>
+  <div class="dsp-presets" id="sub-track-btns"></div>
+  <div class="dsp-status" id="track-status"></div>
 </div>
 <div class="status-bar" id="status-bar">
   <span class="label">Ready</span>
@@ -797,6 +1194,9 @@ async function cast(path) {
 
 async function doStop() {
   await fetch("/api/stop", {method: "POST"});
+  tracksLoaded = false;
+  currentAudioTrack = 0;
+  currentSubTrack = -1;
 }
 
 async function ctrl(action) {
@@ -915,6 +1315,78 @@ function syncDSPFromStatus(dsp) {
   dspChanged();
 }
 
+// --- Tracks ---
+let tracksLoaded = false;
+let currentAudioTrack = 0;
+let currentSubTrack = -1;
+
+function toggleTracks() {
+  const panel = document.getElementById("tracks-panel");
+  const btn = document.getElementById("tracks-toggle");
+  panel.classList.toggle("open");
+  btn.classList.toggle("active", panel.classList.contains("open"));
+  if (panel.classList.contains("open") && !tracksLoaded) loadTracks();
+}
+
+async function loadTracks() {
+  try {
+    const resp = await fetch("/api/tracks");
+    const data = await resp.json();
+    renderTrackButtons(data);
+    tracksLoaded = true;
+  } catch(e) {}
+}
+
+function renderTrackButtons(data) {
+  const audioEl = document.getElementById("audio-track-btns");
+  const subEl = document.getElementById("sub-track-btns");
+  let audioHtml = "";
+  for (let i = 0; i < (data.audio_tracks || []).length; i++) {
+    const t = data.audio_tracks[i];
+    const label = t.title || t.language || ("Track " + (i + 1));
+    const cls = i === currentAudioTrack ? " active" : "";
+    audioHtml += `<button class="${cls}" onclick="selectTrack('audio',${i})">${escHtml(label)}</button>`;
+  }
+  audioEl.innerHTML = audioHtml || '<span style="color:#555;font-size:0.8rem;">None</span>';
+
+  let subHtml = `<button class="${currentSubTrack < 0 ? " active" : ""}" onclick="selectTrack('subtitle',-1)">Off</button>`;
+  for (let i = 0; i < (data.subtitle_files || []).length; i++) {
+    const s = data.subtitle_files[i];
+    const label = s.label || s.language || ("Sub " + (i + 1));
+    const cls = i === currentSubTrack ? " active" : "";
+    subHtml += `<button class="${cls}" onclick="selectTrack('subtitle',${i})">${escHtml(label)}</button>`;
+  }
+  subEl.innerHTML = subHtml;
+}
+
+async function selectTrack(type, index) {
+  const statusEl = document.getElementById("track-status");
+  statusEl.className = "dsp-status applying";
+  statusEl.textContent = "Switching\u2026";
+  try {
+    const resp = await fetch("/api/select_track", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({type, index}),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      if (type === "audio") currentAudioTrack = index;
+      else currentSubTrack = index;
+      statusEl.className = "dsp-status applied";
+      statusEl.textContent = "Switched";
+      setTimeout(() => { statusEl.classList.add("fade"); }, 2000);
+      loadTracks();  // refresh highlight
+    } else {
+      statusEl.className = "dsp-status applying";
+      statusEl.textContent = data.error || "Error";
+    }
+  } catch(e) {
+    statusEl.className = "dsp-status applying";
+    statusEl.textContent = "Error";
+  }
+}
+
 // Keyboard shortcuts
 document.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT") return;
@@ -927,6 +1399,7 @@ document.addEventListener("keydown", (e) => {
     case "m": ctrl("mute"); break;
     case "s": doStop(); break;
     case "e": toggleDSP(); break;
+    case "t": toggleTracks(); break;
   }
 });
 

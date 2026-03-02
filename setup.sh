@@ -28,13 +28,19 @@ bash build.sh
 echo ""
 
 # 4. Disable OTA updates
-echo "[4/5] Disabling OTA updates (com.baidu.ota)..."
+echo "[4/6] Disabling OTA updates (com.baidu.ota)..."
 adb -s "$PROJECTOR" shell pm disable-user --user 0 com.baidu.ota 2>/dev/null || true
 echo "OTA disabled."
 echo ""
 
-# 5. Set our launcher as default home
-echo "[5/5] Setting Mediacast Home as default launcher..."
+# 5. Allow shared temp files (for resume state between apps)
+echo "[5/6] Setting up shared temp directory..."
+adb -s "$PROJECTOR" shell chmod 777 /data/local/tmp
+echo "Done."
+echo ""
+
+# 6. Set our launcher as default home
+echo "[6/6] Setting Mediacast Home as default launcher..."
 adb -s "$PROJECTOR" shell cmd package set-home-activity com.mediacast.launcher/.HomeActivity
 echo "Launcher set."
 echo ""
