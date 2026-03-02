@@ -13,7 +13,6 @@ Requires: adb, ffmpeg, ffprobe
 """
 
 import argparse
-import html
 import json
 import mimetypes
 import os
@@ -24,9 +23,10 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.request import Request, urlopen
+from urllib.error import URLError
 
 # ---------------------------------------------------------------------------
 # Config
@@ -63,18 +63,11 @@ state = {
     "transcoding": False,
     "transcode_progress": "",
     "tmp_file": None,
-    "_serve_mode": None,
+    "_serve_path": None,
 }
 
 dsp_lock = threading.Lock()
 dsp_settings = {"bass": 0, "mid": 0, "treble": 0, "loudnorm": False}
-
-live_stream = {
-    "proc": None,        # ffmpeg subprocess
-    "file_path": None,   # source file being streamed
-    "start_time": None,  # wall-clock time when playback started
-    "seek_offset": 0,    # seconds seeked into the file at start
-}
 
 # Set by main() at startup
 BROWSE_ROOT = ""
@@ -101,94 +94,36 @@ def get_audio_codec(file_path):
     return None
 
 
-def build_audio_filters(dsp):
-    """Build ffmpeg -af filter chain string from DSP settings. Returns None if flat."""
-    filters = []
-    bass, mid, treble = dsp["bass"], dsp["mid"], dsp["treble"]
-    max_gain = max(bass, mid, treble, 0)
-
-    # Headroom to prevent clipping when boosting
-    if max_gain > 0:
-        filters.append(f"volume=-{max_gain}dB")
-
-    if bass != 0:
-        filters.append(f"bass=g={bass}:f=100")
-    if mid != 0:
-        filters.append(f"equalizer=f=1000:t=o:w=1.0:g={mid}")
-    if treble != 0:
-        filters.append(f"treble=g={treble}:f=3000")
-
-    if dsp["loudnorm"]:
-        filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
-
-    return ",".join(filters) if filters else None
+EQ_PLAYER_URL = f"http://{PROJECTOR_IP}:8081"
 
 
-def needs_transcode(audio_codec, dsp):
-    """Return True if codec is BT-incompatible OR any DSP setting is non-flat."""
-    if audio_codec and audio_codec in BT_INCOMPATIBLE_CODECS:
-        return True
-    if dsp["bass"] != 0 or dsp["mid"] != 0 or dsp["treble"] != 0:
-        return True
-    if dsp["loudnorm"]:
-        return True
-    return False
+def send_eq_to_player(dsp):
+    """Convert 3-slider dB values to 5-band millibel values and POST to the EQ player app."""
+    bass_mb = int(dsp["bass"] * 100)
+    mid_mb = int(dsp["mid"] * 100)
+    treble_mb = int(dsp["treble"] * 100)
+    # Map 3 sliders to 5 bands: bass→[0,1], mid→[2], treble→[3,4]
+    bands = [bass_mb, bass_mb, mid_mb, treble_mb, treble_mb]
+    try:
+        data = json.dumps({"bands": bands}).encode()
+        req = Request(f"{EQ_PLAYER_URL}/eq", data=data,
+                      headers={"Content-Type": "application/json"})
+        urlopen(req, timeout=2)
+    except (URLError, OSError) as e:
+        print(f"EQ send failed: {e}")
+
+    # Send loudnorm setting
+    try:
+        data = json.dumps({"enabled": dsp["loudnorm"], "gain": 600}).encode()
+        req = Request(f"{EQ_PLAYER_URL}/loudnorm", data=data,
+                      headers={"Content-Type": "application/json"})
+        urlopen(req, timeout=2)
+    except (URLError, OSError) as e:
+        print(f"Loudnorm send failed: {e}")
 
 
-def dsp_is_nonflat(dsp):
-    """Return True if any EQ slider is non-zero or loudnorm is on."""
-    return dsp["bass"] != 0 or dsp["mid"] != 0 or dsp["treble"] != 0 or dsp["loudnorm"]
-
-
-def start_live_ffmpeg(file_path, dsp, seek_pos=0):
-    """Start an ffmpeg process that streams MPEG-TS to stdout."""
-    # Kill any existing live stream process
-    if live_stream["proc"] is not None:
-        try:
-            live_stream["proc"].kill()
-            live_stream["proc"].wait()
-        except Exception:
-            pass
-
-    af = build_audio_filters(dsp)
-    cmd = ["ffmpeg", "-ss", str(seek_pos), "-i", file_path]
-    if af:
-        cmd += ["-af", af]
-    cmd += ["-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "192k",
-            "-f", "mpegts", "pipe:1"]
-
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-    )
-
-    live_stream["proc"] = proc
-    live_stream["file_path"] = file_path
-    live_stream["start_time"] = time.time()
-    live_stream["seek_offset"] = seek_pos
-
-    return proc
-
-
-def recast_with_new_dsp():
-    """Restart ffmpeg with new DSP settings and tell the projector to reconnect."""
-    file_path = live_stream["file_path"]
-    if not file_path:
-        return
-
-    # Approximate current position in the file
-    seek_pos = live_stream["seek_offset"] + (time.time() - live_stream["start_time"])
-
-    with dsp_lock:
-        dsp = dict(dsp_settings)
-
-    start_live_ffmpeg(file_path, dsp, seek_pos=seek_pos)
-
-    url = f"http://{LOCAL_IP}:{PORT}/media/live.ts"
-    adb_open_url(url, "video/mp2t")
-
-
-def transcode_audio(input_path, audio_filters=None):
-    """Transcode audio to AAC stereo, copy video. Updates state with progress."""
+def transcode_audio(input_path):
+    """Transcode audio to AAC stereo (flat, no EQ filters), copy video."""
     base = os.path.splitext(os.path.basename(input_path))[0]
     out_fd, out_path = tempfile.mkstemp(suffix=".mp4", prefix=f"{base}.")
     os.close(out_fd)
@@ -197,10 +132,9 @@ def transcode_audio(input_path, audio_filters=None):
         state["transcoding"] = True
         state["transcode_progress"] = "starting..."
 
-    cmd = ["ffmpeg", "-y", "-i", input_path]
-    if audio_filters:
-        cmd += ["-af", audio_filters]
-    cmd += ["-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "192k", out_path]
+    cmd = ["ffmpeg", "-y", "-fflags", "+genpts",
+           "-i", input_path,
+           "-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "192k", out_path]
 
     proc = subprocess.Popen(
         cmd,
@@ -261,6 +195,7 @@ def adb_open_url(url, mime):
         "-a", "android.intent.action.VIEW",
         "-d", url,
         "-t", mime,
+        "-n", "com.mediacast.eqplayer/.MainActivity",
     )
 
 
@@ -295,34 +230,15 @@ def safe_resolve(path):
 # Cast logic (runs in background thread)
 # ---------------------------------------------------------------------------
 def do_cast(file_path):
-    """Transcode if needed, then tell projector to play. Runs in a thread."""
+    """Transcode if codec is BT-incompatible, then tell projector to play. Runs in a thread."""
     serve_path = file_path
     tmp = None
 
-    with dsp_lock:
-        dsp = dict(dsp_settings)
-
     acodec = get_audio_codec(file_path)
 
-    if needs_transcode(acodec, dsp) and dsp_is_nonflat(dsp):
-        # Live streaming mode — pipe through ffmpeg in real-time
-        start_live_ffmpeg(file_path, dsp)
-
-        with state_lock:
-            state["tmp_file"] = None
-            state["transcode_progress"] = ""
-            state["casting"] = True
-            state["_serve_mode"] = "live"
-            state["_serve_path"] = None
-
-        url = f"http://{LOCAL_IP}:{PORT}/media/live.ts"
-        adb_open_url(url, "video/mp2t")
-        return
-
-    if needs_transcode(acodec, dsp):
-        # Codec is BT-incompatible but DSP is flat — pre-transcode (preserves Range/seek)
-        af = build_audio_filters(dsp)
-        tmp = transcode_audio(file_path, audio_filters=af)
+    # Only transcode for BT-incompatible codecs (flat audio, no EQ filters)
+    if acodec and acodec in BT_INCOMPATIBLE_CODECS:
+        tmp = transcode_audio(file_path)
         if tmp is None:
             with state_lock:
                 state["casting"] = False
@@ -334,12 +250,10 @@ def do_cast(file_path):
     with state_lock:
         state["tmp_file"] = tmp
         state["transcode_progress"] = ""
-        state["_serve_mode"] = "file"
 
     ext = os.path.splitext(serve_path)[1].lower()
     mime = mimetypes.guess_type(serve_path)[0] or MIME_FALLBACKS.get(ext, "video/mp4")
 
-    # Build the media URL — encode the served filename
     fname = urllib.parse.quote(os.path.basename(serve_path))
     url = f"http://{LOCAL_IP}:{PORT}/media/{fname}"
 
@@ -347,8 +261,12 @@ def do_cast(file_path):
 
     with state_lock:
         state["casting"] = True
-        # Store the actual path being served so the media handler can find it
         state["_serve_path"] = serve_path
+
+    # Apply current EQ settings to the player app
+    with dsp_lock:
+        dsp = dict(dsp_settings)
+    send_eq_to_player(dsp)
 
 
 # ---------------------------------------------------------------------------
@@ -535,68 +453,13 @@ class WebHandler(BaseHTTPRequestHandler):
                 dsp_settings["loudnorm"] = body["loudnorm"]
             result = dict(dsp_settings)
 
-        # Trigger live re-cast if currently casting
-        live_update = False
-        with state_lock:
-            casting = state["casting"]
-            serve_mode = state.get("_serve_mode")
-            cast_file = state.get("file")
+        # Send EQ to projector app (instant, no re-transcode)
+        threading.Thread(target=send_eq_to_player, args=(result,), daemon=True).start()
 
-        if casting and serve_mode == "live":
-            # Already in live mode — restart ffmpeg with new DSP
-            threading.Thread(target=recast_with_new_dsp, daemon=True).start()
-            live_update = True
-        elif casting and serve_mode == "file" and dsp_is_nonflat(result) and cast_file:
-            # Transition from file mode to live mode
-            def switch_to_live():
-                start_live_ffmpeg(cast_file, result)
-                with state_lock:
-                    state["_serve_mode"] = "live"
-                    state["_serve_path"] = None
-                url = f"http://{LOCAL_IP}:{PORT}/media/live.ts"
-                adb_open_url(url, "video/mp2t")
-            threading.Thread(target=switch_to_live, daemon=True).start()
-            live_update = True
-
-        self.send_json({"ok": True, "dsp": result, "live_update": live_update})
+        self.send_json({"ok": True, "dsp": result, "live_update": True})
 
     def handle_media(self, path, send_body):
         """Serve the currently-casting media file with Range support."""
-        with state_lock:
-            serve_mode = state.get("_serve_mode")
-
-        # Live streaming mode — pipe from ffmpeg stdout
-        if serve_mode == "live":
-            file_path = live_stream.get("file_path")
-            if not file_path:
-                self.send_error(503)
-                return
-
-            self.send_response(200)
-            self.send_header("Content-Type", "video/mp2t")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            if not send_body:
-                return
-
-            # Restart ffmpeg so this handler gets a dedicated pipe.
-            # The previous handler (if any) will get EOF on its old
-            # pipe reference and exit cleanly.
-            with dsp_lock:
-                dsp = dict(dsp_settings)
-            seek_pos = live_stream["seek_offset"] + (time.time() - live_stream["start_time"])
-            proc = start_live_ffmpeg(file_path, dsp, seek_pos=seek_pos)
-
-            try:
-                while True:
-                    chunk = proc.stdout.read(256 * 1024)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            return
-
         with state_lock:
             serve_path = state.get("_serve_path")
 
@@ -654,33 +517,19 @@ class WebHandler(BaseHTTPRequestHandler):
             pass
 
     def log_message(self, fmt, *args):
-        if os.environ.get("DEBUG"):
-            super().log_message(fmt, *args)
+        super().log_message(fmt, *args)
 
 
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 def cleanup_cast():
-    # Kill live ffmpeg process if running
-    if live_stream["proc"] is not None:
-        try:
-            live_stream["proc"].kill()
-            live_stream["proc"].wait()
-        except Exception:
-            pass
-    live_stream["proc"] = None
-    live_stream["file_path"] = None
-    live_stream["start_time"] = None
-    live_stream["seek_offset"] = 0
-
     with state_lock:
         state["casting"] = False
         state["file"] = None
         state["transcoding"] = False
         state["transcode_progress"] = ""
         state["_serve_path"] = None
-        state["_serve_mode"] = None
         tmp = state.get("tmp_file")
         state["tmp_file"] = None
     if tmp and os.path.exists(tmp):
@@ -841,7 +690,7 @@ header h1 { font-size: 1.2rem; color: #e94560; }
     <label><input type="checkbox" id="dsp-loudnorm" onchange="dspChanged()"> Loudness normalization</label>
   </div>
   <div class="dsp-status" id="dsp-status"></div>
-  <div class="dsp-note">EQ adjusts live during casting (brief interruption).</div>
+  <div class="dsp-note">EQ applied in real-time on the projector.</div>
 </div>
 <div class="status-bar" id="status-bar">
   <span class="label">Ready</span>
@@ -1016,8 +865,6 @@ function dspPreset(name) {
   dspChanged();
 }
 
-let dspDebounceTimer = null;
-
 function dspChanged() {
   const bass = parseInt(document.getElementById("dsp-bass").value);
   const mid = parseInt(document.getElementById("dsp-mid").value);
@@ -1039,32 +886,22 @@ function dspChanged() {
     }
   }
 
-  // Debounce the POST to avoid rapid re-casts while dragging sliders
-  if (dspDebounceTimer) clearTimeout(dspDebounceTimer);
-  dspDebounceTimer = setTimeout(async () => {
-    const statusEl = document.getElementById("dsp-status");
-    statusEl.className = "dsp-status applying";
-    statusEl.textContent = "Applying\u2026";
-    try {
-      const resp = await fetch("/api/dsp", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({bass, mid, treble, loudnorm}),
-      });
-      const data = await resp.json();
-      if (data.live_update) {
-        statusEl.className = "dsp-status applied";
-        statusEl.textContent = "EQ updated live";
-      } else {
-        statusEl.className = "dsp-status applied";
-        statusEl.textContent = "EQ saved";
-      }
-    } catch(e) {
-      statusEl.className = "dsp-status applying";
-      statusEl.textContent = "Error applying EQ";
-    }
+  // POST immediately — EQ is applied in real-time on the projector, no debounce needed
+  const statusEl = document.getElementById("dsp-status");
+  statusEl.className = "dsp-status applying";
+  statusEl.textContent = "Applying\u2026";
+  fetch("/api/dsp", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({bass, mid, treble, loudnorm}),
+  }).then(r => r.json()).then(data => {
+    statusEl.className = "dsp-status applied";
+    statusEl.textContent = "Applied";
     setTimeout(() => { statusEl.classList.add("fade"); }, 2000);
-  }, 600);
+  }).catch(e => {
+    statusEl.className = "dsp-status applying";
+    statusEl.textContent = "Error applying EQ";
+  });
 }
 
 function syncDSPFromStatus(dsp) {
